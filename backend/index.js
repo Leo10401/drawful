@@ -53,6 +53,34 @@ const roomUsers = {}; // roomId -> Set of socketIds
 const userNames = {}; // socketId -> userName
 const roomLeaders = {}; // roomId -> leaderSocketId
 
+// Game state tracking
+const gameStates = {}; // roomId -> game state
+const roomTimers = {}; // roomId -> timer interval
+
+// Sample prompts for the game
+const PROMPTS = [
+  "A dancing penguin",
+  "A space alien eating pizza",
+  "A flying elephant",
+  "A cat riding a skateboard",
+  "A monkey taking a selfie",
+  "A robot playing basketball",
+  "A submarine in the sky",
+  "A dragon drinking coffee",
+  "A zombie at the beach",
+  "A pineapple wearing sunglasses",
+  "A giraffe on a unicycle",
+  "A dog driving a car",
+  "A banana with arms and legs",
+  "A frog playing a guitar",
+  "A cow jumping over the moon",
+  "A snowman at the beach",
+  "A teddy bear lifting weights",
+  "A pig flying a kite",
+  "A turtle wearing roller skates",
+  "A chicken crossing the road"
+];
+
 function emitRoomMembers(roomId) {
   const members = Array.from(roomUsers[roomId] || []).map(socketId => ({
     id: socketId,
@@ -60,6 +88,49 @@ function emitRoomMembers(roomId) {
     isLeader: socketId === roomLeaders[roomId]
   })).filter(member => member.name);
   io.to(roomId).emit('room-members', members);
+}
+
+// Generate random drawing prompts
+function getRandomPrompts(count = 3) {
+  const shuffled = [...PROMPTS].sort(() => 0.5 - Math.random());
+  return shuffled.slice(0, count);
+}
+
+// Start game timer
+function startTimer(roomId, duration, onTimerTick, onTimerEnd) {
+  let timeLeft = duration;
+  
+  // Clear any existing timer for this room
+  if (roomTimers[roomId]) {
+    clearInterval(roomTimers[roomId]);
+  }
+  
+  // Emit initial time
+  io.to(roomId).emit('timer-update', timeLeft);
+  
+  // Set up the interval
+  roomTimers[roomId] = setInterval(() => {
+    timeLeft -= 1;
+    
+    // Call the tick callback
+    if (onTimerTick) {
+      onTimerTick(timeLeft);
+    }
+    
+    // Emit time update to clients
+    io.to(roomId).emit('timer-update', timeLeft);
+    
+    // Check if timer is done
+    if (timeLeft <= 0) {
+      clearInterval(roomTimers[roomId]);
+      delete roomTimers[roomId];
+      
+      // Call the end callback
+      if (onTimerEnd) {
+        onTimerEnd();
+      }
+    }
+  }, 1000);
 }
 
 io.on("connection", (socket) => {
@@ -149,6 +220,475 @@ io.on("connection", (socket) => {
       const randomRoom = roomsWithUsers[Math.floor(Math.random() * roomsWithUsers.length)];
       callback(randomRoom);
     }
+  });
+
+  // Start a new game
+  socket.on('start-game', ({ roomId, settings }) => {
+    console.log('Starting game in room:', roomId, 'with settings:', settings);
+    
+    // Check if user is leader
+    if (roomLeaders[roomId] !== socket.id) {
+      console.log('Non-leader tried to start game:', socket.id);
+      return;
+    }
+    
+    // Get players in the room
+    const players = Array.from(roomUsers[roomId] || [])
+      .map(id => ({ 
+        id, 
+        name: userNames[id],
+        isLeader: id === roomLeaders[roomId]
+      }))
+      .filter(p => p.name);
+      
+    if (players.length < 2) {
+      console.log('Not enough players to start the game');
+      return;
+    }
+    
+    // Initialize game state
+    gameStates[roomId] = {
+      gameState: 'prompt_selection',
+      players,
+      currentRound: 1,
+      totalRounds: Math.min(players.length * 2, 10), // Set reasonable max rounds
+      activePlayerIndex: 0,
+      activePlayer: players[0],
+      countdown: 30, // Time to select a prompt
+      settings,
+      scores: {}
+    };
+    
+    // Initialize scores
+    players.forEach(player => {
+      gameStates[roomId].scores[player.id] = {
+        name: player.name,
+        total: 0,
+        roundScore: 0
+      };
+    });
+    
+    // Generate prompts for the active player
+    const drawingPrompts = getRandomPrompts(3);
+    
+    // Notify all clients about game state
+    io.to(roomId).emit('game-state-update', {
+      gameState: gameStates[roomId].gameState,
+      activePlayer: gameStates[roomId].activePlayer,
+      currentRound: gameStates[roomId].currentRound,
+      totalRounds: gameStates[roomId].totalRounds,
+      countdown: gameStates[roomId].countdown,
+      drawingPrompts
+    });
+    
+    // Start a timer for prompt selection
+    startTimer(
+      roomId, 
+      30, 
+      (timeLeft) => {
+        gameStates[roomId].countdown = timeLeft;
+      },
+      () => {
+        // If time runs out and no prompt selected, pick a random one
+        if (gameStates[roomId].gameState === 'prompt_selection') {
+          const randomPrompt = drawingPrompts[Math.floor(Math.random() * drawingPrompts.length)];
+          
+          // Move to drawing phase
+          gameStates[roomId].gameState = 'drawing';
+          gameStates[roomId].prompt = randomPrompt;
+          gameStates[roomId].countdown = settings.drawingTime;
+          
+          // Notify all clients
+          io.to(roomId).emit('game-state-update', {
+            gameState: gameStates[roomId].gameState,
+            activePlayer: gameStates[roomId].activePlayer,
+            prompt: randomPrompt,
+            countdown: gameStates[roomId].countdown
+          });
+          
+          // Start drawing timer
+          startTimer(
+            roomId,
+            settings.drawingTime,
+            (timeLeft) => {
+              gameStates[roomId].countdown = timeLeft;
+            },
+            () => {
+              // Time's up for drawing, move to submitting lies
+              if (gameStates[roomId].gameState === 'drawing') {
+                moveToSubmittingLies(roomId);
+              }
+            }
+          );
+        }
+      }
+    );
+    
+    console.log('Game started in room:', roomId);
+  });
+  
+  // Handle prompt selection
+  socket.on('select-prompt', ({ roomId, prompt }) => {
+    const gameState = gameStates[roomId];
+    
+    // Verify this is the active player
+    if (!gameState || gameState.activePlayer.id !== socket.id || gameState.gameState !== 'prompt_selection') {
+      return;
+    }
+    
+    // Set the prompt and move to drawing phase
+    gameState.prompt = prompt;
+    gameState.gameState = 'drawing';
+    gameState.countdown = gameState.settings.drawingTime;
+    
+    // Notify all clients
+    io.to(roomId).emit('game-state-update', {
+      gameState: gameState.gameState,
+      activePlayer: gameState.activePlayer,
+      prompt,
+      countdown: gameState.countdown
+    });
+    
+    // Clear the prompt selection timer and start drawing timer
+    if (roomTimers[roomId]) {
+      clearInterval(roomTimers[roomId]);
+    }
+    
+    startTimer(
+      roomId,
+      gameState.settings.drawingTime,
+      (timeLeft) => {
+        gameState.countdown = timeLeft;
+      },
+      () => {
+        // Time's up for drawing, move to submitting lies
+        if (gameState.gameState === 'drawing') {
+          moveToSubmittingLies(roomId);
+        }
+      }
+    );
+  });
+  
+  // Handle drawing updates
+  socket.on('drawing-update', ({ roomId, dataUrl }) => {
+    const gameState = gameStates[roomId];
+    
+    // Verify this is the active player
+    if (!gameState || gameState.activePlayer.id !== socket.id || gameState.gameState !== 'drawing') {
+      return;
+    }
+    
+    // Store the drawing and broadcast to all clients
+    gameState.drawing = dataUrl;
+    io.to(roomId).emit('drawing-update', dataUrl);
+  });
+  
+  // Function to move to submitting lies phase
+  function moveToSubmittingLies(roomId) {
+    const gameState = gameStates[roomId];
+    
+    gameState.gameState = 'submitting_lies';
+    gameState.countdown = gameState.settings.submittingTime;
+    gameState.lies = [{
+      id: 'truth',
+      text: gameState.prompt,
+      playerId: gameState.activePlayer.id,
+      playerName: gameState.activePlayer.name,
+      isCorrect: true,
+      votes: []
+    }];
+    
+    // Notify all clients
+    io.to(roomId).emit('game-state-update', {
+      gameState: gameState.gameState,
+      countdown: gameState.countdown
+    });
+    
+    startTimer(
+      roomId,
+      gameState.settings.submittingTime,
+      (timeLeft) => {
+        gameState.countdown = timeLeft;
+      },
+      () => {
+        // Time's up for submitting lies, move to voting
+        if (gameState.gameState === 'submitting_lies') {
+          moveToVoting(roomId);
+        }
+      }
+    );
+  }
+  
+  // Handle lie submissions
+  socket.on('submit-lie', ({ roomId, lie, submitterId, submitterName }) => {
+    const gameState = gameStates[roomId];
+    
+    // Verify we're in the right phase and this isn't the active player
+    if (!gameState || gameState.gameState !== 'submitting_lies' || submitterId === gameState.activePlayer.id) {
+      return;
+    }
+    
+    // Check if player already submitted a lie
+    const existingLie = gameState.lies.find(l => l.playerId === submitterId);
+    if (existingLie) {
+      // Update existing lie
+      existingLie.text = lie;
+    } else {
+      // Add new lie
+      gameState.lies.push({
+        id: `lie-${submitterId}`,
+        text: lie,
+        playerId: submitterId,
+        playerName: submitterName,
+        isCorrect: false,
+        votes: []
+      });
+    }
+    
+    // Notify clients about submission progress (not the actual lies yet)
+    io.to(roomId).emit('lies-update', gameState.lies.map(l => ({
+      playerName: l.playerName,
+      playerId: l.playerId
+    })));
+    
+    // If all players have submitted, move to voting phase
+    const nonActivePlayerCount = gameState.players.length - 1;
+    const submissionCount = gameState.lies.length - 1; // Subtract 1 for the truth
+    
+    if (submissionCount >= nonActivePlayerCount) {
+      // Everyone has submitted, move to voting
+      if (roomTimers[roomId]) {
+        clearInterval(roomTimers[roomId]);
+      }
+      moveToVoting(roomId);
+    }
+  });
+  
+  // Function to move to voting phase
+  function moveToVoting(roomId) {
+    const gameState = gameStates[roomId];
+    
+    gameState.gameState = 'voting';
+    gameState.countdown = gameState.settings.votingTime;
+    
+    // Shuffle the lies so the truth isn't always in the same position
+    gameState.lies = gameState.lies.sort(() => 0.5 - Math.random());
+    
+    // Notify all clients
+    io.to(roomId).emit('game-state-update', {
+      gameState: gameState.gameState,
+      countdown: gameState.countdown
+    });
+    
+    // Send the lies to all clients
+    io.to(roomId).emit('lies-update', gameState.lies.map(l => ({
+      id: l.id,
+      text: l.text,
+      playerId: l.playerId,
+      playerName: l.playerName
+    })));
+    
+    startTimer(
+      roomId,
+      gameState.settings.votingTime,
+      (timeLeft) => {
+        gameState.countdown = timeLeft;
+      },
+      () => {
+        // Time's up for voting, move to results
+        if (gameState.gameState === 'voting') {
+          showResults(roomId);
+        }
+      }
+    );
+  }
+  
+  // Handle votes
+  socket.on('vote', ({ roomId, lieId, voterId, voterName }) => {
+    const gameState = gameStates[roomId];
+    
+    // Verify we're in the right phase and this isn't the active player
+    if (!gameState || gameState.gameState !== 'voting') {
+      return;
+    }
+    
+    // Find the lie being voted for
+    const votedLie = gameState.lies.find(l => l.id === lieId);
+    if (!votedLie) return;
+    
+    // Check if player already voted
+    const existingVote = gameState.lies.some(l => l.votes.some(v => v.voterId === voterId));
+    if (existingVote) return;
+    
+    // Add the vote
+    votedLie.votes.push({ voterId, voterName });
+    
+    // If all players have voted, move to results
+    const nonActivePlayerCount = gameState.players.length - 1;
+    const totalVotes = gameState.lies.reduce((sum, lie) => sum + lie.votes.length, 0);
+    
+    if (totalVotes >= nonActivePlayerCount) {
+      // Everyone has voted, move to results
+      if (roomTimers[roomId]) {
+        clearInterval(roomTimers[roomId]);
+      }
+      showResults(roomId);
+    }
+  });
+  
+  // Function to show results
+  function showResults(roomId) {
+    const gameState = gameStates[roomId];
+    
+    gameState.gameState = 'results';
+    
+    // Calculate scores
+    const truthLie = gameState.lies.find(l => l.isCorrect);
+    
+    // Award points for votes on the truth and for having your lie voted on
+    gameState.lies.forEach(lie => {
+      // If this is the truth, the drawer gets points for every vote
+      if (lie.isCorrect && lie.votes.length > 0) {
+        const score = lie.votes.length * 500;
+        gameState.scores[lie.playerId].roundScore += score;
+        gameState.scores[lie.playerId].total += score;
+      } 
+      // If this is a lie, the liar gets points for every vote
+      else if (!lie.isCorrect && lie.votes.length > 0) {
+        const score = lie.votes.length * 100;
+        gameState.scores[lie.playerId].roundScore += score;
+        gameState.scores[lie.playerId].total += score;
+      }
+      
+      // Players who correctly voted for the truth get points
+      if (lie.isCorrect) {
+        lie.votes.forEach(vote => {
+          const score = 200;
+          if (gameState.scores[vote.voterId]) {
+            gameState.scores[vote.voterId].roundScore += score;
+            gameState.scores[vote.voterId].total += score;
+          }
+        });
+      }
+    });
+    
+    // Prepare results object
+    const results = {
+      prompt: gameState.prompt,
+      drawing: gameState.drawing,
+      lies: gameState.lies,
+      scores: gameState.scores
+    };
+    
+    // Send results to clients
+    io.to(roomId).emit('round-results', results);
+  }
+  
+  // Handle next round
+  socket.on('next-round', ({ roomId }) => {
+    const gameState = gameStates[roomId];
+    
+    // Verify this is the leader
+    if (!gameState || roomLeaders[roomId] !== socket.id) {
+      return;
+    }
+    
+    // Reset round-specific state
+    gameState.currentRound++;
+    gameState.activePlayerIndex = (gameState.activePlayerIndex + 1) % gameState.players.length;
+    gameState.activePlayer = gameState.players[gameState.activePlayerIndex];
+    gameState.gameState = 'prompt_selection';
+    gameState.countdown = 30;
+    gameState.lies = [];
+    gameState.drawing = null;
+    gameState.prompt = null;
+    
+    // Reset round scores
+    Object.values(gameState.scores).forEach(score => {
+      score.roundScore = 0;
+    });
+    
+    // Generate prompts for the next player
+    const drawingPrompts = getRandomPrompts(3);
+    
+    // Notify all clients
+    io.to(roomId).emit('game-state-update', {
+      gameState: gameState.gameState,
+      activePlayer: gameState.activePlayer,
+      currentRound: gameState.currentRound,
+      totalRounds: gameState.totalRounds,
+      countdown: gameState.countdown,
+      drawingPrompts
+    });
+    
+    // Start timer for prompt selection
+    startTimer(
+      roomId, 
+      30, 
+      (timeLeft) => {
+        gameState.countdown = timeLeft;
+      },
+      () => {
+        // If time runs out and no prompt selected, pick a random one
+        if (gameState.gameState === 'prompt_selection') {
+          const randomPrompt = drawingPrompts[Math.floor(Math.random() * drawingPrompts.length)];
+          
+          // Move to drawing phase
+          gameState.gameState = 'drawing';
+          gameState.prompt = randomPrompt;
+          gameState.countdown = gameState.settings.drawingTime;
+          
+          // Notify all clients
+          io.to(roomId).emit('game-state-update', {
+            gameState: gameState.gameState,
+            activePlayer: gameState.activePlayer,
+            prompt: randomPrompt,
+            countdown: gameState.countdown
+          });
+          
+          // Start drawing timer
+          startTimer(
+            roomId,
+            gameState.settings.drawingTime,
+            (timeLeft) => {
+              gameState.countdown = timeLeft;
+            },
+            () => {
+              // Time's up for drawing, move to submitting lies
+              if (gameState.gameState === 'drawing') {
+                moveToSubmittingLies(roomId);
+              }
+            }
+          );
+        }
+      }
+    );
+  });
+  
+  // Handle end game
+  socket.on('end-game', ({ roomId }) => {
+    // Verify this is the leader
+    if (roomLeaders[roomId] !== socket.id) {
+      return;
+    }
+    
+    // Clear any active timers
+    if (roomTimers[roomId]) {
+      clearInterval(roomTimers[roomId]);
+      delete roomTimers[roomId];
+    }
+    
+    // Clean up game state
+    delete gameStates[roomId];
+    
+    // Notify all clients
+    io.to(roomId).emit('game-reset');
+    io.to(roomId).emit('chat-message', {
+      userName: 'System',
+      text: 'The game has ended',
+      timestamp: new Date().toISOString(),
+      socketId: null
+    });
   });
 
   // Relay signaling data (offer, answer, ICE candidates)

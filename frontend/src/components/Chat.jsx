@@ -23,13 +23,14 @@ const getInitials = (name) => {
     .substring(0, 2)
 }
 
-const Chat = ({ roomId, userName, isMobile }) => {
+const Chat = ({ roomId, userName, socket, isMobile }) => {
   const [messages, setMessages] = useState([])
   const [newMessage, setNewMessage] = useState("")
   const [socketId, setSocketId] = useState(null)
   const [members, setMembers] = useState([])
   const [isLeader, setIsLeader] = useState(false)
-  const socketRef = useRef()
+  const [players, setPlayers] = useState([])
+  const socketRef = useRef(socket)
   const messagesEndRef = useRef()
 
   const scrollToBottom = () => {
@@ -37,88 +38,42 @@ const Chat = ({ roomId, userName, isMobile }) => {
   }
 
   useEffect(() => {
-    console.log("Connecting to signaling server:", SIGNALING_SERVER)
+    // Update ref when socket prop changes
+    socketRef.current = socket;
+    
+    if (!socket) return;
+    
+    console.log("Using socket from parent with ID:", socket.id);
+    setSocketId(socket.id);
+    
+    // No need to join-chat here as the parent component handles joining
 
-    // Create socket instance with more detailed configuration
-    socketRef.current = io(SIGNALING_SERVER, {
-      transports: ["websocket", "polling"], // Try both transports
-      reconnection: true,
-      reconnectionAttempts: Number.POSITIVE_INFINITY,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
-      timeout: 10000,
-      forceNew: true,
-      autoConnect: true,
-      path: "/socket.io/",
-      query: {
-        roomId,
-        userName,
-      },
-    })
-
-    // Add detailed connection event handlers
-    socketRef.current.on("connect", () => {
-      setSocketId(socketRef.current.id)
-      console.log("Connected to signaling server with ID:", socketRef.current.id)
-      console.log("Joining room:", roomId, "as user:", userName)
-      
-      // Check if a room already exists (by trying to join it first)
-      socketRef.current.emit("get-random-room", (randomRoomId) => {
-        const isNewRoom = !randomRoomId || randomRoomId !== roomId;
-        
-        // If this is likely a new room, join as a leader
-        socketRef.current.emit("join-chat", { roomId, userName, isLeader: isNewRoom });
-      });
-    })
-
-    socketRef.current.on("connect_error", (error) => {
-      console.error("Connection error:", error)
-      console.error("Error details:", {
-        message: error.message,
-        description: error.description,
-        type: error.type,
-      })
-    })
-
-    socketRef.current.on("disconnect", (reason) => {
-      console.log("Disconnected from signaling server:", reason)
-      if (reason === "io server disconnect") {
-        // The disconnection was initiated by the server, you need to reconnect manually
-        socketRef.current.connect()
-      }
-    })
-
-    socketRef.current.on("reconnect", (attemptNumber) => {
-      console.log("Reconnected to signaling server after", attemptNumber, "attempts")
-    })
-
-    socketRef.current.on("reconnect_attempt", (attemptNumber) => {
-      console.log("Attempting to reconnect to signaling server, attempt:", attemptNumber)
-    })
-
-    socketRef.current.on("reconnect_error", (error) => {
-      console.error("Reconnection error:", error)
-    })
-
-    socketRef.current.on("reconnect_failed", () => {
-      console.error("Failed to reconnect to signaling server")
-    })
-
-    socketRef.current.on("chat-message", (message) => {
-      console.log("Received message:", message)
-      setMessages((prev) => [...prev, message])
-    })
+    // Set up event listeners
+    socket.on("chat-message", (message) => {
+      console.log("Received message:", message);
+      setMessages((prev) => [...prev, message]);
+    });
 
     // Listen for room-members event
-    socketRef.current.on("room-members", (memberList) => {
-      setMembers(memberList)
+    socket.on("room-members", (memberList) => {
+      console.log("Room members received:", memberList);
+      setMembers(memberList);
+      
+      // Convert members to players
+      const playersList = memberList.map(member => ({
+        id: member.id,
+        name: member.name,
+        isLeader: member.isLeader
+      }));
+      setPlayers(playersList);
+      console.log("Players updated:", playersList);
       
       // Check if current user is the leader
-      const currentUser = memberList.find(m => m.id === socketRef.current.id);
+      const currentUser = memberList.find(m => m.id === socket.id);
       setIsLeader(currentUser?.isLeader || false);
-    })
+    });
 
-    socketRef.current.on("kicked-from-room", ({ roomId, reason }) => {
+    socket.on("kicked-from-room", ({ roomId, reason }) => {
       alert(reason);
       // Store the kicked status in sessionStorage for the homepage to display
       sessionStorage.setItem('wasKicked', 'true');
@@ -127,12 +82,14 @@ const Chat = ({ roomId, userName, isMobile }) => {
     });
 
     return () => {
-      if (socketRef.current) {
-        console.log("Cleaning up socket connection")
-        socketRef.current.disconnect()
+      // Cleanup event listeners but don't disconnect (parent component handles that)
+      if (socket) {
+        socket.off("chat-message");
+        socket.off("room-members");
+        socket.off("kicked-from-room");
       }
-    }
-  }, [roomId, userName])
+    };
+  }, [socket, roomId, userName]);
 
   useEffect(() => {
     scrollToBottom()
@@ -140,7 +97,7 @@ const Chat = ({ roomId, userName, isMobile }) => {
 
   const sendMessage = (e) => {
     e.preventDefault()
-    if (newMessage.trim()) {
+    if (newMessage.trim() && socketRef.current) {
       const messageData = {
         roomId,
         userName,
@@ -154,7 +111,7 @@ const Chat = ({ roomId, userName, isMobile }) => {
   }
 
   const handleKickUser = (userId) => {
-    if (isLeader && userId !== socketId) {
+    if (isLeader && userId !== socketId && socketRef.current) {
       if (confirm('Are you sure you want to kick this user?')) {
         socketRef.current.emit("kick-user", {
           roomId,
